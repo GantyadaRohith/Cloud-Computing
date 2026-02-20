@@ -9,9 +9,9 @@ from email.message import EmailMessage
 from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Limited Use Spinner", page_icon="🎰")
+st.set_page_config(page_title="Spinner Wheel", page_icon="🎰")
 
-st.title("🎰 Limited Use Option Spinner")
+st.title("🎰 Spinner Wheel")
 st.markdown("""
 Add options and specify how many times each one can be selected. 
 Once an option's limit is reached, it will no longer be available.
