@@ -230,11 +230,41 @@ def spin_shared_once():
             st.session_state.force_local_sync = False
             return spin_result
         except Exception as error:
-            st.session_state.sync_backend = "local"
-            st.session_state.force_local_sync = True
             st.session_state.sync_warning = (
-                f"Cloud spin RPC unavailable ({error}). Using local sync."
+                f"Cloud spin RPC unavailable ({error}). Using standard cloud mode."
             )
+
+        with STATE_OP_LOCK:
+            try:
+                state = load_supabase_state(sync_config)
+                options = state.get("options", [])
+                pool = [index for index, option in enumerate(options) if option.get("remaining", 0) > 0]
+
+                if not pool:
+                    return None
+
+                winner_index = random.choice(pool)
+                winner = options[winner_index]
+                labels_for_spin = [options[index]["name"] for index in pool]
+
+                winner["remaining"] = int(winner.get("remaining", 0)) - 1
+                state["spin_id"] = int(state.get("spin_id", 0)) + 1
+                save_supabase_state(sync_config, state)
+
+                st.session_state.sync_backend = "supabase"
+                st.session_state.force_local_sync = False
+                return {
+                    "winner_name": winner["name"],
+                    "winner_description": winner.get("description", ""),
+                    "labels_for_spin": labels_for_spin,
+                    "spin_id": state["spin_id"]
+                }
+            except Exception as error:
+                st.session_state.sync_backend = "local"
+                st.session_state.force_local_sync = True
+                st.session_state.sync_warning = (
+                    f"Cloud spin unavailable ({error}). Using local sync."
+                )
 
     with STATE_OP_LOCK:
         state = load_shared_state()
