@@ -10,8 +10,13 @@ from pathlib import Path
 import streamlit.components.v1 as components
 from email.message import EmailMessage
 from streamlit.errors import StreamlitSecretNotFoundError
-from streamlit_autorefresh import st_autorefresh
 from filelock import FileLock
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ModuleNotFoundError:
+    def st_autorefresh(interval=0, key=None):
+        return 1
 
 st.set_page_config(page_title="Spinner Wheel", page_icon="🎰")
 
