@@ -150,12 +150,16 @@ def spin_supabase_once(sync_config):
     if payload.get("error"):
         raise ValueError(str(payload["error"]))
 
-    labels_for_spin = payload.get("labels_for_spin", [])
-    if not labels_for_spin:
+    winner_name = payload.get("winner_name")
+    if not winner_name:
         return None
 
+    labels_for_spin = payload.get("labels_for_spin", [])
+    if not labels_for_spin:
+        labels_for_spin = [winner_name]
+
     return {
-        "winner_name": payload.get("winner_name", ""),
+        "winner_name": winner_name,
         "winner_description": payload.get("winner_description", ""),
         "labels_for_spin": labels_for_spin,
         "spin_id": int(payload.get("spin_id", 0))
