@@ -480,6 +480,32 @@ with st.sidebar:
     else:
         st.info("Local sync active")
 
+    with st.expander("Diagnostics", expanded=False):
+        sync_config = get_sync_config()
+        active_count = sum(1 for opt in shared_options if opt.get("remaining", 0) > 0)
+        total_count = len(shared_options)
+
+        st.caption(f"Backend: {st.session_state.sync_backend}")
+        st.caption(f"Force local: {st.session_state.force_local_sync}")
+        st.caption(f"RPC enabled: {st.session_state.spin_rpc_enabled}")
+        st.caption(f"Options: {active_count} active / {total_count} total")
+        st.caption(f"Spin ID: {shared_state.get('spin_id', 0)}")
+
+        test_cloud_btn = st.button(
+            "Test cloud connection",
+            disabled=sync_config is None,
+            key="test_cloud_connection_btn"
+        )
+
+        if sync_config is None:
+            st.caption("Cloud config not set in secrets.")
+        elif test_cloud_btn:
+            try:
+                _ = load_supabase_state(sync_config)
+                st.success("Cloud connection OK")
+            except Exception as error:
+                st.error(f"Cloud check failed: {error}")
+
     if get_smtp_config() is None:
         st.warning("SMTP not configured. Add credentials in .streamlit/secrets.toml")
 
