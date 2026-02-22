@@ -5,6 +5,7 @@ import re
 import smtplib
 import json
 import importlib
+import threading
 from pathlib import Path
 import streamlit.components.v1 as components
 from email.message import EmailMessage
@@ -22,6 +23,7 @@ Once an option's limit is reached, it will no longer be available.
 
 STORE_PATH = Path(__file__).parent / "data" / "shared_state.json"
 LOCK_PATH = str(STORE_PATH) + ".lock"
+STATE_OP_LOCK = threading.Lock()
 
 
 def default_shared_state():
@@ -129,6 +131,37 @@ def save_supabase_state(sync_config, state):
     }).execute()
 
 
+def spin_supabase_once(sync_config):
+    client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
+    app_id = sync_config["app_id"]
+
+    response = client.rpc("spin_once", {"p_id": app_id}).execute()
+    payload = response.data
+
+    if payload is None:
+        raise ValueError("Empty response from spin_once RPC")
+
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected spin_once RPC response format")
+
+    if payload.get("error"):
+        raise ValueError(str(payload["error"]))
+
+    labels_for_spin = payload.get("labels_for_spin", [])
+    if not labels_for_spin:
+        return None
+
+    return {
+        "winner_name": payload.get("winner_name", ""),
+        "winner_description": payload.get("winner_description", ""),
+        "labels_for_spin": labels_for_spin,
+        "spin_id": int(payload.get("spin_id", 0))
+    }
+
+
 def load_shared_state():
     sync_config = get_sync_config()
     if sync_config is None or st.session_state.force_local_sync:
@@ -166,48 +199,65 @@ def save_shared_state(state):
 
 
 def add_option_shared(name, description, limit):
-    state = load_shared_state()
-    options = state.get("options", [])
-    if any(opt.get("name") == name for opt in options):
-        return False, f"'{name}' already exists!"
+    with STATE_OP_LOCK:
+        state = load_shared_state()
+        options = state.get("options", [])
+        if any(opt.get("name") == name for opt in options):
+            return False, f"'{name}' already exists!"
 
-    options.append({
-        "name": name,
-        "description": description,
-        "limit": int(limit),
-        "remaining": int(limit)
-    })
-    state["options"] = options
-    save_shared_state(state)
-    return True, f"Added '{name}'"
+        options.append({
+            "name": name,
+            "description": description,
+            "limit": int(limit),
+            "remaining": int(limit)
+        })
+        state["options"] = options
+        save_shared_state(state)
+        return True, f"Added '{name}'"
 
 
 def reset_shared_state():
-    save_shared_state(default_shared_state())
+    with STATE_OP_LOCK:
+        save_shared_state(default_shared_state())
 
 
 def spin_shared_once():
-    state = load_shared_state()
-    options = state.get("options", [])
-    pool = [index for index, option in enumerate(options) if option.get("remaining", 0) > 0]
+    sync_config = get_sync_config()
+    if sync_config is not None and not st.session_state.force_local_sync:
+        try:
+            spin_result = spin_supabase_once(sync_config)
+            st.session_state.sync_backend = "supabase"
+            st.session_state.force_local_sync = False
+            return spin_result
+        except Exception as error:
+            st.session_state.sync_backend = "local"
+            st.session_state.force_local_sync = True
+            st.session_state.sync_warning = (
+                f"Cloud spin RPC unavailable ({error}). Using local sync."
+            )
 
-    if not pool:
-        return None
+    with STATE_OP_LOCK:
+        state = load_shared_state()
+        options = state.get("options", [])
+        pool = [index for index, option in enumerate(options) if option.get("remaining", 0) > 0]
 
-    winner_index = random.choice(pool)
-    winner = options[winner_index]
-    labels_for_spin = [options[index]["name"] for index in pool]
+        if not pool:
+            return None
 
-    winner["remaining"] = int(winner.get("remaining", 0)) - 1
-    state["spin_id"] = int(state.get("spin_id", 0)) + 1
-    save_shared_state(state)
+        winner_index = random.choice(pool)
+        winner = options[winner_index]
+        labels_for_spin = [options[index]["name"] for index in pool]
 
-    return {
-        "winner_name": winner["name"],
-        "winner_description": winner.get("description", ""),
-        "labels_for_spin": labels_for_spin,
-        "spin_id": state["spin_id"]
-    }
+        winner["remaining"] = int(winner.get("remaining", 0)) - 1
+        state["spin_id"] = int(state.get("spin_id", 0)) + 1
+        save_shared_state(state)
+
+        return {
+            "winner_name": winner["name"],
+            "winner_description": winner.get("description", ""),
+            "labels_for_spin": labels_for_spin,
+            "spin_id": state["spin_id"]
+        }
 
 # Initialize session state for options if it doesn't exist
 if 'last_result' not in st.session_state:

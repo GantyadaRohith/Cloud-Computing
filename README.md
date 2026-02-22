@@ -35,6 +35,83 @@ create table if not exists public.spinner_state (
 	state jsonb not null,
 	updated_at timestamptz not null default now()
 );
+
+create or replace function public.spin_once(p_id text)
+returns jsonb
+language plpgsql
+as $$
+declare
+	v_state jsonb;
+	v_options jsonb;
+	v_pool int[];
+	v_pool_len int;
+	v_pick_idx int;
+	v_winner_idx int;
+	v_winner jsonb;
+	v_spin_id int;
+	v_labels text[];
+begin
+	insert into public.spinner_state (id, state)
+	values (p_id, jsonb_build_object('options', '[]'::jsonb, 'spin_id', 0, 'updated_at', extract(epoch from now())))
+	on conflict (id) do nothing;
+
+	select state into v_state
+	from public.spinner_state
+	where id = p_id
+	for update;
+
+	v_options := coalesce(v_state->'options', '[]'::jsonb);
+
+	select array_agg((elem.ordinality - 1)::int)
+	into v_pool
+	from jsonb_array_elements(v_options) with ordinality as elem(value, ordinality)
+	where coalesce((elem.value->>'remaining')::int, 0) > 0;
+
+	v_pool_len := coalesce(array_length(v_pool, 1), 0);
+	if v_pool_len = 0 then
+		return jsonb_build_object(
+			'winner_name', null,
+			'winner_description', null,
+			'labels_for_spin', '[]'::jsonb,
+			'spin_id', coalesce((v_state->>'spin_id')::int, 0)
+		);
+	end if;
+
+	v_pick_idx := floor(random() * v_pool_len + 1)::int;
+	v_winner_idx := v_pool[v_pick_idx];
+	v_winner := v_options -> v_winner_idx;
+
+	v_options := jsonb_set(
+		v_options,
+		array[v_winner_idx::text, 'remaining'],
+		to_jsonb(greatest(coalesce((v_winner->>'remaining')::int, 0) - 1, 0)),
+		false
+	);
+
+	v_spin_id := coalesce((v_state->>'spin_id')::int, 0) + 1;
+
+	update public.spinner_state
+	set state = jsonb_build_object(
+		'options', v_options,
+		'spin_id', v_spin_id,
+		'updated_at', extract(epoch from now())
+	),
+	updated_at = now()
+	where id = p_id;
+
+	select array_agg(elem.value->>'name')
+	into v_labels
+	from jsonb_array_elements(v_options) as elem(value)
+	where coalesce((elem.value->>'remaining')::int, 0) > 0;
+
+	return jsonb_build_object(
+		'winner_name', v_winner->>'name',
+		'winner_description', coalesce(v_winner->>'description', ''),
+		'labels_for_spin', to_jsonb(coalesce(v_labels, array[]::text[])),
+		'spin_id', v_spin_id
+	);
+end;
+$$;
 ```
 
 3. Add this to `.streamlit/secrets.toml` (or Streamlit Cloud Secrets):
