@@ -4,10 +4,13 @@ import time
 import re
 import smtplib
 import json
+import importlib
+from pathlib import Path
 import streamlit.components.v1 as components
 from email.message import EmailMessage
 from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit_autorefresh import st_autorefresh
+from filelock import FileLock
 
 st.set_page_config(page_title="Spinner Wheel", page_icon="🎰")
 
@@ -17,16 +20,191 @@ Add options and specify how many times each one can be selected.
 Once an option's limit is reached, it will no longer be available.
 """)
 
-# Initialize session state for options if it doesn't exist
-if 'options' not in st.session_state:
-    # Structure: [{'name': 'Option A', 'limit': 3, 'remaining': 3}]
-    st.session_state.options = []
+STORE_PATH = Path(__file__).parent / "data" / "shared_state.json"
+LOCK_PATH = str(STORE_PATH) + ".lock"
 
+
+def default_shared_state():
+    return {
+        "options": [],
+        "spin_id": 0,
+        "updated_at": time.time()
+    }
+
+
+def normalize_state(state):
+    if not isinstance(state, dict):
+        state = default_shared_state()
+
+    if "options" not in state or not isinstance(state["options"], list):
+        state["options"] = []
+    if "spin_id" not in state or not isinstance(state["spin_id"], int):
+        state["spin_id"] = 0
+    if "updated_at" not in state:
+        state["updated_at"] = time.time()
+
+    return state
+
+
+def get_sync_config():
+    try:
+        sync = st.secrets["sync"]
+    except (StreamlitSecretNotFoundError, KeyError, TypeError):
+        return None
+
+    provider = str(sync.get("provider", "")).strip().lower()
+    if provider != "supabase":
+        return None
+
+    url = str(sync.get("supabase_url", "")).strip()
+    key = str(sync.get("supabase_key", "")).strip()
+    app_id = str(sync.get("app_id", "limited-use-spinner")).strip() or "limited-use-spinner"
+
+    if not url or not key:
+        return None
+
+    return {
+        "provider": "supabase",
+        "supabase_url": url,
+        "supabase_key": key,
+        "app_id": app_id
+    }
+
+
+@st.cache_resource
+def get_supabase_client(url, key):
+    supabase_module = importlib.import_module("supabase")
+    return supabase_module.create_client(url, key)
+
+
+def ensure_store_exists():
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(LOCK_PATH, timeout=5):
+        if not STORE_PATH.exists():
+            STORE_PATH.write_text(json.dumps(default_shared_state(), indent=2), encoding="utf-8")
+
+
+def load_local_shared_state():
+    ensure_store_exists()
+    with FileLock(LOCK_PATH, timeout=5):
+        try:
+            state = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            state = default_shared_state()
+        return normalize_state(state)
+
+
+def save_local_shared_state(state):
+    state = normalize_state(state)
+    state["updated_at"] = time.time()
+    payload = json.dumps(state, indent=2)
+    with FileLock(LOCK_PATH, timeout=5):
+        STORE_PATH.write_text(payload, encoding="utf-8")
+
+
+def load_supabase_state(sync_config):
+    client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
+    app_id = sync_config["app_id"]
+
+    response = client.table("spinner_state").select("state").eq("id", app_id).limit(1).execute()
+    if response.data:
+        return normalize_state(response.data[0].get("state"))
+
+    state = default_shared_state()
+    client.table("spinner_state").upsert({
+        "id": app_id,
+        "state": state
+    }).execute()
+    return state
+
+
+def save_supabase_state(sync_config, state):
+    client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
+    app_id = sync_config["app_id"]
+    state = normalize_state(state)
+    state["updated_at"] = time.time()
+    client.table("spinner_state").upsert({
+        "id": app_id,
+        "state": state
+    }).execute()
+
+
+def load_shared_state():
+    sync_config = get_sync_config()
+    if sync_config is None:
+        st.session_state.sync_backend = "local"
+        return load_local_shared_state()
+
+    try:
+        state = load_supabase_state(sync_config)
+        st.session_state.sync_backend = "supabase"
+        return state
+    except Exception:
+        st.session_state.sync_backend = "local"
+        st.session_state.sync_warning = "Cloud sync unavailable. Using local sync."
+        return load_local_shared_state()
+
+
+def save_shared_state(state):
+    sync_config = get_sync_config()
+    if sync_config is None:
+        return save_local_shared_state(state)
+
+    try:
+        return save_supabase_state(sync_config, state)
+    except Exception:
+        st.session_state.sync_backend = "local"
+        st.session_state.sync_warning = "Cloud sync unavailable. Using local sync."
+        return save_local_shared_state(state)
+
+
+def add_option_shared(name, description, limit):
+    state = load_shared_state()
+    options = state.get("options", [])
+    if any(opt.get("name") == name for opt in options):
+        return False, f"'{name}' already exists!"
+
+    options.append({
+        "name": name,
+        "description": description,
+        "limit": int(limit),
+        "remaining": int(limit)
+    })
+    state["options"] = options
+    save_shared_state(state)
+    return True, f"Added '{name}'"
+
+
+def reset_shared_state():
+    save_shared_state(default_shared_state())
+
+
+def spin_shared_once():
+    state = load_shared_state()
+    options = state.get("options", [])
+    pool = [index for index, option in enumerate(options) if option.get("remaining", 0) > 0]
+
+    if not pool:
+        return None
+
+    winner_index = random.choice(pool)
+    winner = options[winner_index]
+    labels_for_spin = [options[index]["name"] for index in pool]
+
+    winner["remaining"] = int(winner.get("remaining", 0)) - 1
+    state["spin_id"] = int(state.get("spin_id", 0)) + 1
+    save_shared_state(state)
+
+    return {
+        "winner_name": winner["name"],
+        "winner_description": winner.get("description", ""),
+        "labels_for_spin": labels_for_spin,
+        "spin_id": state["spin_id"]
+    }
+
+# Initialize session state for options if it doesn't exist
 if 'last_result' not in st.session_state:
     st.session_state.last_result = None
-
-if 'spin_id' not in st.session_state:
-    st.session_state.spin_id = 0
 
 if 'last_sent_signature' not in st.session_state:
     st.session_state.last_sent_signature = None
@@ -36,6 +214,18 @@ if 'last_spin_wheel' not in st.session_state:
 
 if 'pending_wheel_animation' not in st.session_state:
     st.session_state.pending_wheel_animation = False
+
+if 'sync_backend' not in st.session_state:
+    st.session_state.sync_backend = "local"
+
+if 'sync_warning' not in st.session_state:
+    st.session_state.sync_warning = None
+
+shared_state = load_shared_state()
+shared_options = shared_state["options"]
+
+if not st.session_state.pending_wheel_animation:
+    st_autorefresh(interval=3000, key="sync-refresh")
 
 def get_smtp_config():
     try:
@@ -199,6 +389,20 @@ def render_wheel(labels, winner_name=None, animate=False, spin_key=0):
 # --- Sidebar: Add New Options ---
 with st.sidebar:
     st.header("Add New Option")
+    sync_backend_label = "Cloud (Supabase)" if st.session_state.sync_backend == "supabase" else "Local file"
+    updated_at_value = shared_state.get("updated_at")
+    if isinstance(updated_at_value, (int, float)):
+        updated_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at_value))
+    else:
+        updated_at_text = "Unknown"
+
+    st.caption(f"Sync: {sync_backend_label}")
+    st.caption(f"Last update: {updated_at_text}")
+    if st.session_state.sync_backend == "supabase":
+        st.success("Cloud sync active")
+    else:
+        st.info("Local sync active")
+
     if get_smtp_config() is None:
         st.warning("SMTP not configured. Add credentials in .streamlit/secrets.toml")
 
@@ -209,21 +413,16 @@ with st.sidebar:
         submitted = st.form_submit_button("Add Option")
         
         if submitted and new_option_name:
-            # Check for duplicates (optional, but good practice)
-            if any(opt['name'] == new_option_name for opt in st.session_state.options):
-                st.error(f"'{new_option_name}' already exists!")
+            ok, message = add_option_shared(new_option_name, new_option_desc, new_option_limit)
+            if ok:
+                st.success(message)
+                st.rerun()
             else:
-                st.session_state.options.append({
-                    'name': new_option_name,
-                    'description': new_option_desc,
-                    'limit': new_option_limit,
-                    'remaining': new_option_limit
-                })
-                st.success(f"Added '{new_option_name}'")
+                st.error(message)
 
     st.divider()
     if st.button("Reset All", type="primary"):
-        st.session_state.options = []
+        reset_shared_state()
         st.session_state.last_result = None
         st.session_state.last_spin_wheel = None
         st.session_state.pending_wheel_animation = False
@@ -235,24 +434,20 @@ wheel_col, options_col = st.columns([2.2, 1])
 
 with wheel_col:
     st.subheader("Spinner")
+    backend_label = "Cloud (Supabase)" if st.session_state.sync_backend == "supabase" else "Local file"
+    st.caption(f"Auto-sync enabled via {backend_label} (refreshes every 3 seconds).")
+    if st.session_state.sync_warning:
+        st.warning(st.session_state.sync_warning)
+        st.session_state.sync_warning = None
     
-    # Calculate available pool
     pool = []
-    for index, opt in enumerate(st.session_state.options):
-        # We add the index to the pool as many times as it has remaining?
-        # OR just once if it has > 0 and we want equal probability per unique item?
-        # Usually "wheel" implies prob weighted by size, but "usage limit" might just mean availability.
-        # Let's assume: Each available item has an equal chance of being picked, regardless of how many "uses" it has left.
-        # If the user wants weighted probability (more uses left = higher chance), we can change this logic.
-        
-        # User request: "add each option on which it lands and how many times that option can be used"
-        # Simplest interpretation: It is in the bag if count > 0.
+    for index, opt in enumerate(shared_options):
         if opt['remaining'] > 0:
             pool.append(index)
     
     can_spin = len(pool) > 0
 
-    active_labels_now = [st.session_state.options[index]['name'] for index in pool]
+    active_labels_now = [shared_options[index]['name'] for index in pool]
     is_animating_run = st.session_state.pending_wheel_animation and st.session_state.last_spin_wheel is not None
 
     if is_animating_run:
@@ -276,18 +471,18 @@ with wheel_col:
         render_wheel(
             labels=active_labels_now,
             animate=False,
-            spin_key=st.session_state.spin_id
+            spin_key=shared_state.get("spin_id", 0)
         )
     
     spin_btn = st.button("SPIN!", disabled=not can_spin, use_container_width=True, type="primary")
 
 with options_col:
     with st.expander("Current Options", expanded=False):
-        if not st.session_state.options:
+        if not shared_options:
             st.info("No options added yet. Use the sidebar to add some!")
         else:
-            active_options = [opt for opt in st.session_state.options if opt['remaining'] > 0]
-            finished_options = [opt for opt in st.session_state.options if opt['remaining'] == 0]
+            active_options = [opt for opt in shared_options if opt['remaining'] > 0]
+            finished_options = [opt for opt in shared_options if opt['remaining'] == 0]
 
             if active_options:
                 st.caption("Active")
@@ -302,22 +497,21 @@ with options_col:
 if spin_btn:
     with st.spinner("Spinning..."):
         time.sleep(1)
-        winner_index = random.choice(pool)
-        winner = st.session_state.options[winner_index]
-        labels_for_spin = [st.session_state.options[index]['name'] for index in pool]
+        spin_result = spin_shared_once()
+        if spin_result is None:
+            st.warning("No options available to spin.")
+            st.rerun()
 
-        st.session_state.spin_id += 1
         st.session_state.last_spin_wheel = {
-            'labels': labels_for_spin,
-            'winner_name': winner['name'],
-            'spin_id': st.session_state.spin_id
+            'labels': spin_result['labels_for_spin'],
+            'winner_name': spin_result['winner_name'],
+            'spin_id': spin_result['spin_id']
         }
         st.session_state.pending_wheel_animation = True
-        st.session_state.options[winner_index]['remaining'] -= 1
         st.session_state.last_result = {
-            'name': winner['name'],
-            'description': winner.get('description', ''),
-            'spin_id': st.session_state.spin_id
+            'name': spin_result['winner_name'],
+            'description': spin_result['winner_description'],
+            'spin_id': spin_result['spin_id']
         }
         st.session_state['result_email_input'] = ""
         st.rerun()
