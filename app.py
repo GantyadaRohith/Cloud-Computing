@@ -162,6 +162,11 @@ def spin_supabase_once(sync_config):
     }
 
 
+def is_missing_spin_rpc_error(error):
+    message = str(error)
+    return "PGRST202" in message or "Could not find the function public.spin_once" in message
+
+
 def load_shared_state():
     sync_config = get_sync_config()
     if sync_config is None or st.session_state.force_local_sync:
@@ -223,16 +228,18 @@ def reset_shared_state():
 
 def spin_shared_once():
     sync_config = get_sync_config()
-    if sync_config is not None and not st.session_state.force_local_sync:
+    if sync_config is not None and not st.session_state.force_local_sync and st.session_state.spin_rpc_enabled:
         try:
             spin_result = spin_supabase_once(sync_config)
             st.session_state.sync_backend = "supabase"
             st.session_state.force_local_sync = False
             return spin_result
         except Exception as error:
-            st.session_state.sync_warning = (
-                f"Cloud spin RPC unavailable ({error}). Using standard cloud mode."
-            )
+            if is_missing_spin_rpc_error(error):
+                st.session_state.spin_rpc_enabled = False
+                st.session_state.sync_warning = "Atomic cloud RPC not installed. Using standard cloud mode."
+            else:
+                st.session_state.sync_warning = "Cloud spin RPC unavailable. Using standard cloud mode."
 
     with STATE_OP_LOCK:
         state = load_shared_state()
@@ -278,6 +285,9 @@ if 'sync_warning' not in st.session_state:
 
 if 'force_local_sync' not in st.session_state:
     st.session_state.force_local_sync = False
+
+if 'spin_rpc_enabled' not in st.session_state:
+    st.session_state.spin_rpc_enabled = True
 
 shared_state = load_shared_state()
 shared_options = shared_state["options"]
