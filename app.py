@@ -131,30 +131,37 @@ def save_supabase_state(sync_config, state):
 
 def load_shared_state():
     sync_config = get_sync_config()
-    if sync_config is None:
+    if sync_config is None or st.session_state.force_local_sync:
         st.session_state.sync_backend = "local"
         return load_local_shared_state()
 
     try:
         state = load_supabase_state(sync_config)
         st.session_state.sync_backend = "supabase"
+        st.session_state.force_local_sync = False
         return state
-    except Exception:
+    except Exception as error:
         st.session_state.sync_backend = "local"
-        st.session_state.sync_warning = "Cloud sync unavailable. Using local sync."
+        st.session_state.force_local_sync = True
+        st.session_state.sync_warning = f"Cloud sync unavailable ({error}). Using local sync."
         return load_local_shared_state()
 
 
 def save_shared_state(state):
     sync_config = get_sync_config()
-    if sync_config is None:
+    if sync_config is None or st.session_state.force_local_sync:
+        st.session_state.sync_backend = "local"
         return save_local_shared_state(state)
 
     try:
-        return save_supabase_state(sync_config, state)
-    except Exception:
+        result = save_supabase_state(sync_config, state)
+        st.session_state.sync_backend = "supabase"
+        st.session_state.force_local_sync = False
+        return result
+    except Exception as error:
         st.session_state.sync_backend = "local"
-        st.session_state.sync_warning = "Cloud sync unavailable. Using local sync."
+        st.session_state.force_local_sync = True
+        st.session_state.sync_warning = f"Cloud sync unavailable ({error}). Using local sync."
         return save_local_shared_state(state)
 
 
@@ -220,6 +227,9 @@ if 'sync_backend' not in st.session_state:
 
 if 'sync_warning' not in st.session_state:
     st.session_state.sync_warning = None
+
+if 'force_local_sync' not in st.session_state:
+    st.session_state.force_local_sync = False
 
 shared_state = load_shared_state()
 shared_options = shared_state["options"]
