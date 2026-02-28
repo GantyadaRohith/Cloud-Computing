@@ -421,6 +421,24 @@ def record_spin_assignment(spin_id, option_name):
             st.session_state.sync_warning = f"Assignment log save failed ({error})."
 
 
+def ensure_assignment_for_result(result):
+    if not isinstance(result, dict):
+        return False
+
+    spin_id = result.get("spin_id")
+    option_name = str(result.get("name", "")).strip()
+    if not isinstance(spin_id, int) or not option_name:
+        return False
+
+    state = load_shared_state()
+    assignments = state.get("assignments", [])
+    if any(isinstance(item, dict) and item.get("spin_id") == spin_id for item in assignments):
+        return False
+
+    record_spin_assignment(spin_id, option_name)
+    return True
+
+
 def submit_completion(spin_id, team_name):
     sync_config = get_sync_config()
     if sync_config is not None and not st.session_state.force_local_sync and st.session_state.submit_rpc_enabled:
@@ -822,11 +840,13 @@ if spin_btn:
         st.session_state['result_email_input'] = ""
         st.rerun()
 
-if st.session_state.last_result and not is_animating_run:
+if st.session_state.last_result:
     result = st.session_state.last_result
     st.success(f"Result: **{result['name']}**")
     if result.get('description'):
         st.info(f"**Description:** {result['description']}")
+    if is_animating_run:
+        st.caption("Result is already locked in while wheel animation finishes.")
 
     st.markdown("### 📧 Send Result Automatically")
     recipient_email = st.text_input(
@@ -860,6 +880,14 @@ if st.session_state.last_result and not is_animating_run:
 
 st.markdown("### 🏁 Completion & Leaderboard")
 submit_col, leaderboard_col = st.columns([1, 1.4])
+
+if st.session_state.last_result:
+    try:
+        if ensure_assignment_for_result(st.session_state.last_result):
+            shared_state = load_shared_state()
+            shared_options = shared_state["options"]
+    except Exception as error:
+        st.session_state.sync_warning = f"Assignment recovery failed ({error})."
 
 assignments_all = shared_state.get("assignments", [])
 pending_assignments = [item for item in assignments_all if isinstance(item, dict) and not item.get("completed_at_ms")]
