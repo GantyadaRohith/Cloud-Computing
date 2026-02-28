@@ -142,6 +142,18 @@ def get_supabase_client(url, key):
     return supabase_module.create_client(url, key)
 
 
+def run_with_retries(operation, attempts=3, delay_seconds=0.35):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception as error:
+            last_error = error
+            if attempt < attempts - 1:
+                time.sleep(delay_seconds)
+    raise last_error
+
+
 def ensure_store_exists():
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(LOCK_PATH, timeout=5):
@@ -171,15 +183,15 @@ def load_supabase_state(sync_config):
     client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
     app_id = sync_config["app_id"]
 
-    response = client.table("spinner_state").select("state").eq("id", app_id).limit(1).execute()
+    response = run_with_retries(lambda: client.table("spinner_state").select("state").eq("id", app_id).limit(1).execute())
     if response.data:
         return normalize_state(response.data[0].get("state"))
 
     state = default_shared_state()
-    client.table("spinner_state").upsert({
+    run_with_retries(lambda: client.table("spinner_state").upsert({
         "id": app_id,
         "state": state
-    }).execute()
+    }).execute())
     return state
 
 
@@ -188,17 +200,17 @@ def save_supabase_state(sync_config, state):
     app_id = sync_config["app_id"]
     state = normalize_state(state)
     state["updated_at"] = time.time()
-    client.table("spinner_state").upsert({
+    run_with_retries(lambda: client.table("spinner_state").upsert({
         "id": app_id,
         "state": state
-    }).execute()
+    }).execute())
 
 
 def spin_supabase_once(sync_config):
     client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
     app_id = sync_config["app_id"]
 
-    response = client.rpc("spin_once", {"p_id": app_id}).execute()
+    response = run_with_retries(lambda: client.rpc("spin_once", {"p_id": app_id}).execute())
     payload = response.data
 
     if payload is None:
@@ -232,11 +244,11 @@ def spin_supabase_once(sync_config):
 def submit_supabase_completion_once(sync_config, spin_id, team_name):
     client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
 
-    response = client.rpc("submit_completion_once", {
+    response = run_with_retries(lambda: client.rpc("submit_completion_once", {
         "p_id": sync_config["app_id"],
         "p_spin_id": int(spin_id),
         "p_team_name": str(team_name)
-    }).execute()
+    }).execute())
     payload = response.data
 
     if payload is None:
@@ -278,8 +290,7 @@ def load_shared_state():
         return state
     except Exception as error:
         st.session_state.sync_backend = "local"
-        st.session_state.force_local_sync = True
-        st.session_state.sync_warning = f"Cloud sync unavailable ({error}). Using local sync."
+        st.session_state.sync_warning = f"Cloud read unavailable ({error}). Showing local snapshot for now."
         return load_local_shared_state()
 
 
@@ -295,28 +306,34 @@ def save_shared_state(state):
         st.session_state.force_local_sync = False
         return result
     except Exception as error:
-        st.session_state.sync_backend = "local"
-        st.session_state.force_local_sync = True
-        st.session_state.sync_warning = f"Cloud sync unavailable ({error}). Using local sync."
-        return save_local_shared_state(state)
+        st.session_state.sync_backend = "supabase"
+        st.session_state.sync_warning = f"Cloud save failed ({error}). Change was not saved to cloud."
+        raise RuntimeError("Cloud save failed") from error
 
 
 def add_option_shared(name, description, limit):
     with STATE_OP_LOCK:
-        state = load_shared_state()
-        options = state.get("options", [])
-        if any(opt.get("name") == name for opt in options):
-            return False, f"'{name}' already exists!"
+        try:
+            clean_name = name.strip()
+            if not clean_name:
+                return False, "Option name is required."
 
-        options.append({
-            "name": name,
-            "description": description,
-            "limit": int(limit),
-            "remaining": int(limit)
-        })
-        state["options"] = options
-        save_shared_state(state)
-        return True, f"Added '{name}'"
+            state = load_shared_state()
+            options = state.get("options", [])
+            if any(str(opt.get("name", "")).strip().lower() == clean_name.lower() for opt in options):
+                return False, f"'{clean_name}' already exists!"
+
+            options.append({
+                "name": clean_name,
+                "description": description,
+                "limit": int(limit),
+                "remaining": int(limit)
+            })
+            state["options"] = options
+            save_shared_state(state)
+            return True, f"Added '{clean_name}'"
+        except Exception as error:
+            return False, f"Failed to add option: {error}"
 
 
 def reset_shared_state():
@@ -398,7 +415,10 @@ def record_spin_assignment(spin_id, option_name):
             "submission_seq": None
         })
         state["assignments"] = assignments
-        save_shared_state(state)
+        try:
+            save_shared_state(state)
+        except Exception as error:
+            st.session_state.sync_warning = f"Assignment log save failed ({error})."
 
 
 def submit_completion(spin_id, team_name):
@@ -417,24 +437,27 @@ def submit_completion(spin_id, team_name):
                 st.session_state.sync_warning = "Cloud submit RPC unavailable. Using standard submit mode."
 
     with STATE_OP_LOCK:
-        state = load_shared_state()
-        assignments = state.get("assignments", [])
-        next_submission_seq = int(state.get("next_submission_seq", 1))
-        if next_submission_seq < 1:
-            next_submission_seq = 1
-        for item in assignments:
-            if isinstance(item, dict) and item.get("spin_id") == int(spin_id):
-                if item.get("completed_at_ms"):
-                    return False, "This task was already submitted."
-                item["team_name"] = team_name.strip()
-                item["completed_at_ms"] = current_time_ms()
-                item["submission_seq"] = next_submission_seq
-                state["next_submission_seq"] = next_submission_seq + 1
-                state["assignments"] = assignments
-                save_shared_state(state)
-                return True, "Completion submitted successfully."
+        try:
+            state = load_shared_state()
+            assignments = state.get("assignments", [])
+            next_submission_seq = int(state.get("next_submission_seq", 1))
+            if next_submission_seq < 1:
+                next_submission_seq = 1
+            for item in assignments:
+                if isinstance(item, dict) and item.get("spin_id") == int(spin_id):
+                    if item.get("completed_at_ms"):
+                        return False, "This task was already submitted."
+                    item["team_name"] = team_name.strip()
+                    item["completed_at_ms"] = current_time_ms()
+                    item["submission_seq"] = next_submission_seq
+                    state["next_submission_seq"] = next_submission_seq + 1
+                    state["assignments"] = assignments
+                    save_shared_state(state)
+                    return True, "Completion submitted successfully."
 
-        return False, "Task assignment not found."
+            return False, "Task assignment not found."
+        except Exception as error:
+            return False, f"Submit failed: {error}"
 
 # Initialize session state for options if it doesn't exist
 if 'last_result' not in st.session_state:
@@ -774,7 +797,6 @@ with options_col:
 
 if spin_btn:
     with st.spinner("Spinning..."):
-        time.sleep(1)
         try:
             spin_result = spin_shared_once()
         except Exception as error:
