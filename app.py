@@ -36,6 +36,7 @@ def default_shared_state():
     return {
         "options": [],
         "assignments": [],
+        "latest_result": None,
         "next_submission_seq": 1,
         "spin_id": 0,
         "updated_at": time.time()
@@ -50,6 +51,8 @@ def normalize_state(state):
         state["options"] = []
     if "assignments" not in state or not isinstance(state["assignments"], list):
         state["assignments"] = []
+    if "latest_result" not in state or not isinstance(state["latest_result"], dict):
+        state["latest_result"] = None
     if "next_submission_seq" not in state or not isinstance(state["next_submission_seq"], int):
         state["next_submission_seq"] = 1
     if state["next_submission_seq"] < 1:
@@ -91,6 +94,19 @@ def normalize_state(state):
         })
 
     state["assignments"] = normalized_assignments
+
+    latest_result = state.get("latest_result")
+    if isinstance(latest_result, dict):
+        result_spin_id = latest_result.get("spin_id")
+        result_name = str(latest_result.get("name", "")).strip()
+        if not isinstance(result_spin_id, int) or not result_name:
+            state["latest_result"] = None
+        else:
+            state["latest_result"] = {
+                "name": result_name,
+                "description": str(latest_result.get("description", "")),
+                "spin_id": result_spin_id
+            }
 
     return state
 
@@ -279,14 +295,13 @@ def is_missing_submit_rpc_error(error):
 
 def load_shared_state():
     sync_config = get_sync_config()
-    if sync_config is None or st.session_state.force_local_sync:
+    if sync_config is None:
         st.session_state.sync_backend = "local"
         return load_local_shared_state()
 
     try:
         state = load_supabase_state(sync_config)
         st.session_state.sync_backend = "supabase"
-        st.session_state.force_local_sync = False
         return state
     except Exception as error:
         st.session_state.sync_backend = "local"
@@ -296,14 +311,13 @@ def load_shared_state():
 
 def save_shared_state(state):
     sync_config = get_sync_config()
-    if sync_config is None or st.session_state.force_local_sync:
+    if sync_config is None:
         st.session_state.sync_backend = "local"
         return save_local_shared_state(state)
 
     try:
         result = save_supabase_state(sync_config, state)
         st.session_state.sync_backend = "supabase"
-        st.session_state.force_local_sync = False
         return result
     except Exception as error:
         st.session_state.sync_backend = "supabase"
@@ -343,16 +357,23 @@ def reset_shared_state():
 
 def spin_shared_once():
     sync_config = get_sync_config()
-    if sync_config is not None and not st.session_state.force_local_sync and st.session_state.spin_rpc_enabled:
+    if sync_config is not None and st.session_state.spin_rpc_enabled:
         try:
             spin_result = spin_supabase_once(sync_config)
             st.session_state.sync_backend = "supabase"
-            st.session_state.force_local_sync = False
             if spin_result is not None:
                 try:
                     record_spin_assignment(spin_result["spin_id"], spin_result["winner_name"])
                 except Exception as error:
                     st.session_state.sync_warning = f"Spin recorded, but assignment log failed ({error})."
+                try:
+                    update_latest_result_shared({
+                        "name": spin_result["winner_name"],
+                        "description": spin_result.get("winner_description", ""),
+                        "spin_id": spin_result["spin_id"]
+                    })
+                except Exception as error:
+                    st.session_state.sync_warning = f"Spin saved, but latest-result sync failed ({error})."
             return spin_result
         except Exception as error:
             if is_missing_spin_rpc_error(error):
@@ -388,6 +409,11 @@ def spin_shared_once():
         if not any(item.get("spin_id") == spin_assignment["spin_id"] for item in assignments if isinstance(item, dict)):
             assignments.append(spin_assignment)
         state["assignments"] = assignments
+        state["latest_result"] = {
+            "name": winner["name"],
+            "description": winner.get("description", ""),
+            "spin_id": state["spin_id"]
+        }
 
         save_shared_state(state)
 
@@ -421,31 +447,35 @@ def record_spin_assignment(spin_id, option_name):
             st.session_state.sync_warning = f"Assignment log save failed ({error})."
 
 
-def ensure_assignment_for_result(result):
+def update_latest_result_shared(result):
     if not isinstance(result, dict):
-        return False
+        return
 
     spin_id = result.get("spin_id")
-    option_name = str(result.get("name", "")).strip()
-    if not isinstance(spin_id, int) or not option_name:
-        return False
+    name = str(result.get("name", "")).strip()
+    if not isinstance(spin_id, int) or not name:
+        return
 
-    state = load_shared_state()
-    assignments = state.get("assignments", [])
-    if any(isinstance(item, dict) and item.get("spin_id") == spin_id for item in assignments):
-        return False
+    with STATE_OP_LOCK:
+        state = load_shared_state()
+        existing = state.get("latest_result")
+        if isinstance(existing, dict) and isinstance(existing.get("spin_id"), int) and existing.get("spin_id") >= spin_id:
+            return
 
-    record_spin_assignment(spin_id, option_name)
-    return True
+        state["latest_result"] = {
+            "name": name,
+            "description": str(result.get("description", "")),
+            "spin_id": spin_id
+        }
+        save_shared_state(state)
 
 
 def submit_completion(spin_id, team_name):
     sync_config = get_sync_config()
-    if sync_config is not None and not st.session_state.force_local_sync and st.session_state.submit_rpc_enabled:
+    if sync_config is not None and st.session_state.submit_rpc_enabled:
         try:
             ok, message = submit_supabase_completion_once(sync_config, spin_id, team_name)
             st.session_state.sync_backend = "supabase"
-            st.session_state.force_local_sync = False
             return ok, message
         except Exception as error:
             if is_missing_submit_rpc_error(error):
@@ -499,9 +529,6 @@ if 'sync_backend' not in st.session_state:
 if 'sync_warning' not in st.session_state:
     st.session_state.sync_warning = None
 
-if 'force_local_sync' not in st.session_state:
-    st.session_state.force_local_sync = False
-
 if 'spin_rpc_enabled' not in st.session_state:
     st.session_state.spin_rpc_enabled = True
 
@@ -510,6 +537,18 @@ if 'submit_rpc_enabled' not in st.session_state:
 
 shared_state = load_shared_state()
 shared_options = shared_state["options"]
+
+shared_latest_result = shared_state.get("latest_result")
+session_latest_result = st.session_state.last_result
+if isinstance(shared_latest_result, dict):
+    shared_spin_id = shared_latest_result.get("spin_id") if isinstance(shared_latest_result.get("spin_id"), int) else -1
+    session_spin_id = session_latest_result.get("spin_id") if isinstance(session_latest_result, dict) and isinstance(session_latest_result.get("spin_id"), int) else -1
+    if shared_spin_id > session_spin_id:
+        st.session_state.last_result = {
+            "name": shared_latest_result.get("name"),
+            "description": shared_latest_result.get("description", ""),
+            "spin_id": shared_spin_id
+        }
 
 if not st.session_state.pending_wheel_animation:
     st_autorefresh(interval=3000, key="sync-refresh")
@@ -696,7 +735,6 @@ with st.sidebar:
         total_count = len(shared_options)
 
         st.caption(f"Backend: {st.session_state.sync_backend}")
-        st.caption(f"Force local: {st.session_state.force_local_sync}")
         st.caption(f"RPC enabled: {st.session_state.spin_rpc_enabled}")
         st.caption(f"Submit RPC enabled: {st.session_state.submit_rpc_enabled}")
         st.caption(f"Options: {active_count} active / {total_count} total")
@@ -880,14 +918,6 @@ if st.session_state.last_result:
 
 st.markdown("### 🏁 Completion & Leaderboard")
 submit_col, leaderboard_col = st.columns([1, 1.4])
-
-if st.session_state.last_result:
-    try:
-        if ensure_assignment_for_result(st.session_state.last_result):
-            shared_state = load_shared_state()
-            shared_options = shared_state["options"]
-    except Exception as error:
-        st.session_state.sync_warning = f"Assignment recovery failed ({error})."
 
 assignments_all = shared_state.get("assignments", [])
 pending_assignments = [item for item in assignments_all if isinstance(item, dict) and not item.get("completed_at_ms")]
