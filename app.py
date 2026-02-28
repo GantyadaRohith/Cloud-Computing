@@ -449,6 +449,9 @@ if 'last_spin_wheel' not in st.session_state:
 if 'pending_wheel_animation' not in st.session_state:
     st.session_state.pending_wheel_animation = False
 
+if 'pending_spin_started_at_ms' not in st.session_state:
+    st.session_state.pending_spin_started_at_ms = None
+
 if 'sync_backend' not in st.session_state:
     st.session_state.sync_backend = "local"
 
@@ -729,13 +732,18 @@ with wheel_col:
             spin_key=wheel_state['spin_id']
         )
         st.caption("Spinning... result will appear once the wheel lands.")
+        elapsed_ms = None
+        if isinstance(st.session_state.pending_spin_started_at_ms, int):
+            elapsed_ms = current_time_ms() - st.session_state.pending_spin_started_at_ms
+
         refresh_count = st_autorefresh(
             interval=4300,
             key=f"spin-finish-{wheel_state['spin_id']}"
         )
-        if refresh_count < 1:
+        if refresh_count < 1 and (elapsed_ms is None or elapsed_ms < 4300):
             st.stop()
         st.session_state.pending_wheel_animation = False
+        st.session_state.pending_spin_started_at_ms = None
         st.rerun()
     else:
         render_wheel(
@@ -788,6 +796,7 @@ if spin_btn:
             'description': spin_result['winner_description'],
             'spin_id': spin_result['spin_id']
         }
+        st.session_state.pending_spin_started_at_ms = current_time_ms()
         st.session_state['result_email_input'] = ""
         st.rerun()
 
