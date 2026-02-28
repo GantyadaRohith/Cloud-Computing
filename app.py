@@ -293,7 +293,7 @@ def is_missing_submit_rpc_error(error):
     return "PGRST202" in message or "Could not find the function public.submit_completion_once" in message
 
 
-def load_shared_state():
+def load_shared_state(require_cloud=False):
     sync_config = get_sync_config()
     if sync_config is None:
         st.session_state.sync_backend = "local"
@@ -304,6 +304,10 @@ def load_shared_state():
         st.session_state.sync_backend = "supabase"
         return state
     except Exception as error:
+        if require_cloud:
+            st.session_state.sync_backend = "supabase"
+            st.session_state.sync_warning = f"Cloud read failed ({error}). Operation was blocked to prevent data loss."
+            raise RuntimeError("Cloud read failed") from error
         st.session_state.sync_backend = "local"
         st.session_state.sync_warning = f"Cloud read unavailable ({error}). Showing local snapshot for now."
         return load_local_shared_state()
@@ -332,7 +336,7 @@ def add_option_shared(name, description, limit):
             if not clean_name:
                 return False, "Option name is required."
 
-            state = load_shared_state()
+            state = load_shared_state(require_cloud=True)
             options = state.get("options", [])
             if any(str(opt.get("name", "")).strip().lower() == clean_name.lower() for opt in options):
                 return False, f"'{clean_name}' already exists!"
@@ -383,7 +387,7 @@ def spin_shared_once():
                 st.session_state.sync_warning = "Cloud spin RPC unavailable. Using standard cloud mode."
 
     with STATE_OP_LOCK:
-        state = load_shared_state()
+        state = load_shared_state(require_cloud=True)
         options = state.get("options", [])
         pool = [index for index, option in enumerate(options) if option.get("remaining", 0) > 0]
 
@@ -427,7 +431,7 @@ def spin_shared_once():
 
 def record_spin_assignment(spin_id, option_name):
     with STATE_OP_LOCK:
-        state = load_shared_state()
+        state = load_shared_state(require_cloud=True)
         assignments = state.get("assignments", [])
         if any(item.get("spin_id") == int(spin_id) for item in assignments if isinstance(item, dict)):
             return
@@ -457,7 +461,7 @@ def update_latest_result_shared(result):
         return
 
     with STATE_OP_LOCK:
-        state = load_shared_state()
+        state = load_shared_state(require_cloud=True)
         existing = state.get("latest_result")
         if isinstance(existing, dict) and isinstance(existing.get("spin_id"), int) and existing.get("spin_id") >= spin_id:
             return
@@ -486,7 +490,7 @@ def submit_completion(spin_id, team_name):
 
     with STATE_OP_LOCK:
         try:
-            state = load_shared_state()
+            state = load_shared_state(require_cloud=True)
             assignments = state.get("assignments", [])
             next_submission_seq = int(state.get("next_submission_seq", 1))
             if next_submission_seq < 1:
