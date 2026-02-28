@@ -6,6 +6,7 @@ import smtplib
 import json
 import importlib
 import threading
+from datetime import datetime
 from pathlib import Path
 import streamlit.components.v1 as components
 from email.message import EmailMessage
@@ -34,6 +35,8 @@ STATE_OP_LOCK = threading.Lock()
 def default_shared_state():
     return {
         "options": [],
+        "assignments": [],
+        "next_submission_seq": 1,
         "spin_id": 0,
         "updated_at": time.time()
     }
@@ -45,12 +48,67 @@ def normalize_state(state):
 
     if "options" not in state or not isinstance(state["options"], list):
         state["options"] = []
+    if "assignments" not in state or not isinstance(state["assignments"], list):
+        state["assignments"] = []
+    if "next_submission_seq" not in state or not isinstance(state["next_submission_seq"], int):
+        state["next_submission_seq"] = 1
+    if state["next_submission_seq"] < 1:
+        state["next_submission_seq"] = 1
     if "spin_id" not in state or not isinstance(state["spin_id"], int):
         state["spin_id"] = 0
     if "updated_at" not in state:
         state["updated_at"] = time.time()
 
+    normalized_assignments = []
+    fallback_assigned_ms = int(float(state.get("updated_at", time.time())) * 1000)
+    for item in state["assignments"]:
+        if not isinstance(item, dict):
+            continue
+        spin_id = item.get("spin_id")
+        option_name = str(item.get("option_name", "")).strip()
+        if not isinstance(spin_id, int) or not option_name:
+            continue
+
+        assigned_at_raw = item.get("assigned_at_ms")
+        if isinstance(assigned_at_raw, (int, float)):
+            assigned_at_ms = int(assigned_at_raw)
+        else:
+            assigned_at_ms = fallback_assigned_ms
+
+        completed_raw = item.get("completed_at_ms")
+        if isinstance(completed_raw, (int, float)):
+            completed_at_ms = int(completed_raw)
+        else:
+            completed_at_ms = None
+
+        normalized_assignments.append({
+            "spin_id": spin_id,
+            "option_name": option_name,
+            "assigned_at_ms": assigned_at_ms,
+            "team_name": str(item.get("team_name", "")).strip(),
+            "completed_at_ms": completed_at_ms,
+            "submission_seq": int(item.get("submission_seq")) if isinstance(item.get("submission_seq"), int) and int(item.get("submission_seq")) > 0 else None
+        })
+
+    state["assignments"] = normalized_assignments
+
     return state
+
+
+def current_time_ms():
+    return int(time.time_ns() // 1_000_000)
+
+
+def format_timestamp_ms(value):
+    if not isinstance(value, (int, float)):
+        return "-"
+    return datetime.fromtimestamp(float(value) / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def format_duration_ms(duration_ms):
+    if not isinstance(duration_ms, (int, float)):
+        return "-"
+    return f"{int(duration_ms)} ms"
 
 
 def get_sync_config():
@@ -171,9 +229,40 @@ def spin_supabase_once(sync_config):
     }
 
 
+def submit_supabase_completion_once(sync_config, spin_id, team_name):
+    client = get_supabase_client(sync_config["supabase_url"], sync_config["supabase_key"])
+
+    response = client.rpc("submit_completion_once", {
+        "p_id": sync_config["app_id"],
+        "p_spin_id": int(spin_id),
+        "p_team_name": str(team_name)
+    }).execute()
+    payload = response.data
+
+    if payload is None:
+        raise ValueError("Empty response from submit_completion_once RPC")
+
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected submit_completion_once RPC response format")
+
+    if payload.get("error"):
+        return False, str(payload["error"])
+    if payload.get("ok") is True:
+        return True, str(payload.get("message") or "Completion submitted successfully.")
+    return False, str(payload.get("message") or "Completion failed.")
+
+
 def is_missing_spin_rpc_error(error):
     message = str(error)
     return "PGRST202" in message or "Could not find the function public.spin_once" in message
+
+
+def is_missing_submit_rpc_error(error):
+    message = str(error)
+    return "PGRST202" in message or "Could not find the function public.submit_completion_once" in message
 
 
 def load_shared_state():
@@ -242,6 +331,11 @@ def spin_shared_once():
             spin_result = spin_supabase_once(sync_config)
             st.session_state.sync_backend = "supabase"
             st.session_state.force_local_sync = False
+            if spin_result is not None:
+                try:
+                    record_spin_assignment(spin_result["spin_id"], spin_result["winner_name"])
+                except Exception as error:
+                    st.session_state.sync_warning = f"Spin recorded, but assignment log failed ({error})."
             return spin_result
         except Exception as error:
             if is_missing_spin_rpc_error(error):
@@ -264,6 +358,20 @@ def spin_shared_once():
 
         winner["remaining"] = int(winner.get("remaining", 0)) - 1
         state["spin_id"] = int(state.get("spin_id", 0)) + 1
+
+        spin_assignment = {
+            "spin_id": state["spin_id"],
+            "option_name": winner["name"],
+            "assigned_at_ms": current_time_ms(),
+            "team_name": "",
+            "completed_at_ms": None,
+            "submission_seq": None
+        }
+        assignments = state.get("assignments", [])
+        if not any(item.get("spin_id") == spin_assignment["spin_id"] for item in assignments if isinstance(item, dict)):
+            assignments.append(spin_assignment)
+        state["assignments"] = assignments
+
         save_shared_state(state)
 
         return {
@@ -272,6 +380,61 @@ def spin_shared_once():
             "labels_for_spin": labels_for_spin,
             "spin_id": state["spin_id"]
         }
+
+
+def record_spin_assignment(spin_id, option_name):
+    with STATE_OP_LOCK:
+        state = load_shared_state()
+        assignments = state.get("assignments", [])
+        if any(item.get("spin_id") == int(spin_id) for item in assignments if isinstance(item, dict)):
+            return
+
+        assignments.append({
+            "spin_id": int(spin_id),
+            "option_name": str(option_name),
+            "assigned_at_ms": current_time_ms(),
+            "team_name": "",
+            "completed_at_ms": None,
+            "submission_seq": None
+        })
+        state["assignments"] = assignments
+        save_shared_state(state)
+
+
+def submit_completion(spin_id, team_name):
+    sync_config = get_sync_config()
+    if sync_config is not None and not st.session_state.force_local_sync and st.session_state.submit_rpc_enabled:
+        try:
+            ok, message = submit_supabase_completion_once(sync_config, spin_id, team_name)
+            st.session_state.sync_backend = "supabase"
+            st.session_state.force_local_sync = False
+            return ok, message
+        except Exception as error:
+            if is_missing_submit_rpc_error(error):
+                st.session_state.submit_rpc_enabled = False
+                st.session_state.sync_warning = "Atomic submit RPC not installed. Using standard submit mode."
+            else:
+                st.session_state.sync_warning = "Cloud submit RPC unavailable. Using standard submit mode."
+
+    with STATE_OP_LOCK:
+        state = load_shared_state()
+        assignments = state.get("assignments", [])
+        next_submission_seq = int(state.get("next_submission_seq", 1))
+        if next_submission_seq < 1:
+            next_submission_seq = 1
+        for item in assignments:
+            if isinstance(item, dict) and item.get("spin_id") == int(spin_id):
+                if item.get("completed_at_ms"):
+                    return False, "This task was already submitted."
+                item["team_name"] = team_name.strip()
+                item["completed_at_ms"] = current_time_ms()
+                item["submission_seq"] = next_submission_seq
+                state["next_submission_seq"] = next_submission_seq + 1
+                state["assignments"] = assignments
+                save_shared_state(state)
+                return True, "Completion submitted successfully."
+
+        return False, "Task assignment not found."
 
 # Initialize session state for options if it doesn't exist
 if 'last_result' not in st.session_state:
@@ -297,6 +460,9 @@ if 'force_local_sync' not in st.session_state:
 
 if 'spin_rpc_enabled' not in st.session_state:
     st.session_state.spin_rpc_enabled = True
+
+if 'submit_rpc_enabled' not in st.session_state:
+    st.session_state.submit_rpc_enabled = True
 
 shared_state = load_shared_state()
 shared_options = shared_state["options"]
@@ -488,6 +654,7 @@ with st.sidebar:
         st.caption(f"Backend: {st.session_state.sync_backend}")
         st.caption(f"Force local: {st.session_state.force_local_sync}")
         st.caption(f"RPC enabled: {st.session_state.spin_rpc_enabled}")
+        st.caption(f"Submit RPC enabled: {st.session_state.submit_rpc_enabled}")
         st.caption(f"Options: {active_count} active / {total_count} total")
         st.caption(f"Spin ID: {shared_state.get('spin_id', 0)}")
 
@@ -659,3 +826,78 @@ if st.session_state.last_result and not is_animating_run:
                         st.error(f"Failed to send email: {error}")
             else:
                 st.caption("Email already sent for this spin result and address.")
+
+st.markdown("### 🏁 Completion & Leaderboard")
+submit_col, leaderboard_col = st.columns([1, 1.4])
+
+assignments_all = shared_state.get("assignments", [])
+pending_assignments = [item for item in assignments_all if isinstance(item, dict) and not item.get("completed_at_ms")]
+completed_assignments = [item for item in assignments_all if isinstance(item, dict) and item.get("completed_at_ms")]
+
+with submit_col:
+    st.markdown("#### Submit Completed Task")
+    if not pending_assignments:
+        st.info("No pending assigned tasks right now.")
+    else:
+        assignment_labels = {}
+        for item in sorted(pending_assignments, key=lambda row: int(row.get("spin_id", 0))):
+            spin_id = int(item.get("spin_id", 0))
+            label = f"#{spin_id} • {item.get('option_name', 'Task')} • {format_timestamp_ms(item.get('assigned_at_ms'))}"
+            assignment_labels[label] = spin_id
+
+        with st.form("submit_completion_form", clear_on_submit=True):
+            selected_label = st.selectbox("Assigned task", list(assignment_labels.keys()))
+            team_name_input = st.text_input("Team name")
+            completion_submit = st.form_submit_button("Submit")
+
+            if completion_submit:
+                team_name = team_name_input.strip()
+                if not team_name:
+                    st.error("Please enter your team name.")
+                else:
+                    ok, message = submit_completion(assignment_labels[selected_label], team_name)
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+with leaderboard_col:
+    st.markdown("#### Leaderboard")
+    if not completed_assignments:
+        st.info("No completed submissions yet.")
+    else:
+        leaderboard_rows = []
+        for item in completed_assignments:
+            assigned_at_ms = int(item.get("assigned_at_ms", 0))
+            completed_at_ms = int(item.get("completed_at_ms", 0))
+            duration_ms = max(completed_at_ms - assigned_at_ms, 0)
+            leaderboard_rows.append({
+                "Team": item.get("team_name") or "-",
+                "Task": item.get("option_name") or "-",
+                "Spin #": int(item.get("spin_id", 0)),
+                "Assigned at": format_timestamp_ms(assigned_at_ms),
+                "Completed at": format_timestamp_ms(completed_at_ms),
+                "Time": format_duration_ms(duration_ms),
+                "_duration_sort": duration_ms,
+                "_completed_sort": completed_at_ms,
+                "_submission_seq_sort": int(item.get("submission_seq", 0)) if isinstance(item.get("submission_seq"), int) else 0
+            })
+
+        leaderboard_rows.sort(key=lambda row: (row["_duration_sort"], row["_completed_sort"], row["_submission_seq_sort"]))
+        for index, row in enumerate(leaderboard_rows, start=1):
+            row["Rank"] = index
+
+        display_rows = []
+        for row in leaderboard_rows:
+            display_rows.append({
+                "Rank": row["Rank"],
+                "Team": row["Team"],
+                "Task": row["Task"],
+                "Spin #": row["Spin #"],
+                "Assigned at": row["Assigned at"],
+                "Completed at": row["Completed at"],
+                "Time": row["Time"]
+            })
+
+        st.dataframe(display_rows, use_container_width=True, hide_index=True)

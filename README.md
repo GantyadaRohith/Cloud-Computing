@@ -112,6 +112,81 @@ begin
 	);
 end;
 $$;
+
+create or replace function public.submit_completion_once(
+	p_id text,
+	p_spin_id int,
+	p_team_name text
+)
+returns jsonb
+language plpgsql
+as $$
+declare
+	v_state jsonb;
+	v_assignments jsonb;
+	v_len int;
+	v_item jsonb;
+	v_found boolean := false;
+	v_completed boolean := false;
+	v_now_ms bigint := floor(extract(epoch from clock_timestamp()) * 1000)::bigint;
+	v_next_seq int;
+	v_submission_seq int;
+begin
+	insert into public.spinner_state (id, state)
+	values (p_id, jsonb_build_object('options', '[]'::jsonb, 'assignments', '[]'::jsonb, 'next_submission_seq', 1, 'spin_id', 0, 'updated_at', extract(epoch from now())))
+	on conflict (id) do nothing;
+
+	select state into v_state
+	from public.spinner_state
+	where id = p_id
+	for update;
+
+	v_assignments := coalesce(v_state->'assignments', '[]'::jsonb);
+	v_len := coalesce(jsonb_array_length(v_assignments), 0);
+	v_next_seq := greatest(coalesce((v_state->>'next_submission_seq')::int, 1), 1);
+	v_submission_seq := v_next_seq;
+
+	for i in 0..greatest(v_len - 1, -1) loop
+		if i < 0 then
+			exit;
+		end if;
+		v_item := v_assignments -> i;
+		if coalesce((v_item->>'spin_id')::int, -1) = p_spin_id then
+			v_found := true;
+			if (v_item ? 'completed_at_ms') and (v_item->>'completed_at_ms') is not null and btrim(v_item->>'completed_at_ms') <> '' then
+				v_completed := true;
+				exit;
+			end if;
+
+			v_item := jsonb_set(v_item, '{team_name}', to_jsonb(p_team_name), true);
+			v_item := jsonb_set(v_item, '{completed_at_ms}', to_jsonb(v_now_ms), true);
+			v_item := jsonb_set(v_item, '{submission_seq}', to_jsonb(v_submission_seq), true);
+			v_assignments := jsonb_set(v_assignments, array[i::text], v_item, false);
+			exit;
+		end if;
+	end loop;
+
+	if not v_found then
+		return jsonb_build_object('ok', false, 'error', 'Task assignment not found.');
+	end if;
+
+	if v_completed then
+		return jsonb_build_object('ok', false, 'error', 'This task was already submitted.');
+	end if;
+
+	update public.spinner_state
+	set state = jsonb_set(
+		jsonb_set(v_state, '{assignments}', v_assignments, true),
+		'{next_submission_seq}',
+		to_jsonb(v_submission_seq + 1),
+		true
+	),
+	updated_at = now()
+	where id = p_id;
+
+	return jsonb_build_object('ok', true, 'message', 'Completion submitted successfully.');
+end;
+$$;
 ```
 
 3. Add this to `.streamlit/secrets.toml` (or Streamlit Cloud Secrets):
